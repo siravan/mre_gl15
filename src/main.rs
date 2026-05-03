@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use num_complex;
 use serde::Deserialize;
 use std::{
     fs,
@@ -19,11 +18,10 @@ use symbolica::{
     id::{MatchSettings, Replacement},
     parse_lit, try_parse,
 };
-use symjit::{Config, Defuns};
 
-mod compile;
+use std::time::Instant;
 
-use crate::compile::compile;
+const N: usize = 10000;
 
 const DEFAULT_PAYLOAD: &str = "payload.json";
 const DEFAULT_ARTIFACT_DIR: &str = "artifacts";
@@ -182,31 +180,47 @@ fn input_values(payload: &Payload) -> Vec<Complex<f64>> {
 fn eval_eager(
     eval: &mut ExpressionEvaluator<Complex<f64>>,
     input: &[Complex<f64>],
-) -> Complex<f64> {
+) -> Result<(Complex<f64>, f64)> {
     let mut out = vec![Complex::new(0.0, 0.0); 1];
-    eval.evaluate(input, &mut out);
-    out[0]
+
+    let t0 = Instant::now();
+
+    for _ in 0..N {
+        eval.evaluate(input, &mut out);
+    }
+
+    let duration = t0.elapsed().as_secs_f64();
+
+    Ok((out[0], duration))
 }
 
 fn eval_symjit(
     eval: &mut ExpressionEvaluator<Complex<f64>>,
     input: &[Complex<f64>],
-) -> Result<Complex<f64>> {
-    let eval = eval
-        .clone()
-        .map_coeff(&|z| num_complex::Complex::new(z.re, z.im));
+) -> Result<(Complex<f64>, f64)> {
+    let eval = eval.clone().map_coeff(&|z| Complex::new(z.re, z.im));
+
+    /*
     let mut config = Config::default();
     config.set_complex(true);
     config.set_simd(true);
-    let app = compile(&eval, config, Defuns::new(), 0)?;
-    let input: Vec<num_complex::Complex<f64>> = input
-        .iter()
-        .map(|z| num_complex::Complex::new(z.re, z.im))
-        .collect();
-    let mut out = vec![num_complex::Complex::new(0.0, 0.0); 1];
+    let mut app = compile(&eval, config, Defuns::new(), 0)?;
+    */
 
-    app.evaluate(&input, &mut out);
-    Ok(Complex::new(out[0].re, out[0].im))
+    let mut app = eval.jit_compile().unwrap();
+
+    let input: Vec<Complex<f64>> = input.iter().map(|z| Complex::new(z.re, z.im)).collect();
+    let mut out = vec![Complex::new(0.0, 0.0); 1];
+
+    let t0 = Instant::now();
+
+    for _ in 0..N {
+        app.evaluate(&input, &mut out);
+    }
+
+    let duration = t0.elapsed().as_secs_f64();
+
+    Ok((out[0], duration))
 }
 
 fn eval_assembly(
@@ -214,7 +228,7 @@ fn eval_assembly(
     input: &[Complex<f64>],
     artifact_dir: &Path,
     function_name: &str,
-) -> Result<Complex<f64>> {
+) -> Result<(Complex<f64>, f64)> {
     fs::create_dir_all(artifact_dir)?;
     let cpp = artifact_dir.join(format!("{function_name}.cpp"));
     let so = artifact_dir.join(format!("{function_name}.so"));
@@ -234,8 +248,16 @@ fn eval_assembly(
         .load()
         .map_err(|e| anyhow!(e))?;
     let mut out = vec![Complex::new(0.0, 0.0); 1];
-    compiled.evaluate(input, &mut out);
-    Ok(out[0])
+
+    let t0 = Instant::now();
+
+    for _ in 0..N {
+        compiled.evaluate(input, &mut out);
+    }
+
+    let duration = t0.elapsed().as_secs_f64();
+
+    Ok((out[0], duration))
 }
 
 fn max_abs_diff(lhs: Complex<f64>, rhs: Complex<f64>) -> f64 {
@@ -267,21 +289,31 @@ fn main() -> Result<()> {
     println!("expression: {}", payload.exprs[0]);
 
     let mut eager_eval = build_evaluator(&payload)?;
-    let eager = eval_eager(&mut eager_eval, &input);
-    println!("eager   = {eager}");
+    let (eager, t1) = eval_eager(&mut eager_eval, &input)?;
+    println!(
+        "eager   = {eager}\n in {:.2} μsec",
+        1000000.0 * t1 / (N as f64)
+    );
 
     let mut assembly_eval = build_evaluator(&payload)?;
-    let assembly = eval_assembly(
+    let (assembly, t2) = eval_assembly(
         &mut assembly_eval,
         &input,
         &artifact_dir,
         &payload.function_name,
     )?;
-    println!("assembly= {assembly}");
+
+    println!(
+        "assembly= {assembly}\n in {:.2} μsec",
+        1000000.0 * t2 / (N as f64)
+    );
 
     let mut symjit_eval = build_evaluator(&payload)?;
-    let symjit = eval_symjit(&mut symjit_eval, &input)?;
-    println!("symjit  = {symjit}");
+    let (symjit, t3) = eval_symjit(&mut symjit_eval, &input)?;
+    println!(
+        "symjit  = {symjit}\n in {:.2} μsec",
+        1000000.0 * t3 / (N as f64)
+    );
 
     let symjit_mismatch = max_abs_diff(symjit, assembly);
     let assembly_mismatch = max_abs_diff(assembly, eager);

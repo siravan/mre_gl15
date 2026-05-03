@@ -104,7 +104,7 @@ pub fn compile<T: Clone + Number>(
 ) -> Result<Application> {
     let (instructions, _, constants) = ev.export_instructions();
     let constants: Vec<Complex<f64>> = constants.iter().map(|x| x.as_complex()).collect();
-    let mut translator = translate(instructions, constants, config, df, false)?;
+    let mut translator = translate(instructions, constants, config, df, true)?;
     translator.set_num_params(num_params);
     translator.compile()
 }
