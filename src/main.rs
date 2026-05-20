@@ -200,13 +200,6 @@ fn eval_symjit(
 ) -> Result<(Complex<f64>, f64)> {
     let eval = eval.clone().map_coeff(&|z| Complex::new(z.re, z.im));
 
-    /*
-    let mut config = Config::default();
-    config.set_complex(true);
-    config.set_simd(true);
-    let mut app = compile(&eval, config, Defuns::new(), 0)?;
-    */
-
     let mut app = eval.jit_compile().unwrap();
 
     let input: Vec<Complex<f64>> = input.iter().map(|z| Complex::new(z.re, z.im)).collect();
