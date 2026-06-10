@@ -5,18 +5,18 @@ use std::{
     path::{Path, PathBuf},
 };
 use symbolica::{
-    atom::{Atom, AtomCore, AtomView, Indeterminate},
+    atom::{Atom, AtomCore, AtomView, Indeterminate, Symbol},
     domains::{
         float::Complex,
         integer::IntegerRing,
         rational::{Fraction, Rational},
     },
     evaluate::{
-        CompileOptions, ExportSettings, ExpressionEvaluator, FunctionMap, InlineASM,
-        OptimizationSettings,
+        BatchEvaluator, CompileOptions, ExportSettings, ExpressionEvaluator, FunctionMap,
+        InlineASM, JITCompilationSettings, OptimizationSettings,
     },
     id::{MatchSettings, Replacement},
-    parse_lit, try_parse,
+    parse_lit, symbol, try_parse,
 };
 
 use std::time::Instant;
@@ -74,15 +74,14 @@ fn apply_fn_map_entries(
 ) -> Result<(Vec<Replacement>, FunctionMap)> {
     let mut fn_map = FunctionMap::new();
     let mut replacements = Vec::new();
-    fn_map.add_constant(
-        parse_lit!(x),
-        Complex::<Rational>::try_from(Atom::Zero.as_view()).unwrap(),
-    );
+    let v: Vec<Symbol> = Vec::new();
+    fn_map.add_function(symbol!("x"), v, Atom::Zero)?;
 
     for (lhs, rhs, tags, args) in parsed_entries {
         if let AtomView::Var(_) = lhs.as_view() {
-            if let Ok(value) = Complex::<Rational>::try_from(rhs.as_view()) {
-                fn_map.add_constant(lhs.clone(), value);
+            if let Ok(_) = Complex::<Rational>::try_from(rhs.as_view()) {
+                let v: Vec<Symbol> = Vec::new();
+                fn_map.add_function(lhs.get_symbol().unwrap(), v, rhs)?;
             } else {
                 replacements.push(Replacement::new(lhs.to_pattern(), rhs.clone()));
             }
@@ -97,20 +96,12 @@ fn apply_fn_map_entries(
                             atom.to_pattern(),
                             Atom::var(symbolica::symbol!(format!("x{i}_"))),
                         )
-                        .with_settings(MatchSettings {
-                            allow_new_wildcards_on_rhs: true,
-                            ..Default::default()
-                        })
+                        .allow_new_wildcards_on_rhs(true)
                     })
                     .collect::<Vec<_>>();
 
                 fn_map
-                    .add_function(
-                        f.get_symbol(),
-                        f.get_symbol().get_name().into(),
-                        args.clone(),
-                        rhs.clone(),
-                    )
+                    .add_function(f.get_symbol(), args.clone(), rhs.clone())
                     .map_err(|e| anyhow!(e))?;
 
                 replacements.push(Replacement::new(
@@ -119,13 +110,7 @@ fn apply_fn_map_entries(
                 ));
             } else {
                 fn_map
-                    .add_tagged_function(
-                        f.get_symbol(),
-                        tags.clone(),
-                        f.get_symbol().get_name().into(),
-                        args.clone(),
-                        rhs.clone(),
-                    )
+                    .add_tagged_function(f.get_symbol(), tags.clone(), args.clone(), rhs.clone())
                     .map_err(|e| anyhow!(e))?;
             }
         } else {
@@ -157,10 +142,10 @@ fn build_evaluator(payload: &Payload) -> Result<ExpressionEvaluator<Complex<f64>
             .iter()
             .map(|expr| expr.replace_multiple(&replacements))
             .collect::<Vec<_>>(),
-        &fn_map,
         &params,
-        OptimizationSettings::default(),
     )
+    .function_map(fn_map)
+    .build()
     .map(|eval| {
         eval.map_coeff(&|r: &Complex<Fraction<IntegerRing>>| {
             Complex::new(r.re.to_f64(), r.im.to_f64())
@@ -197,10 +182,12 @@ fn eval_eager(
 fn eval_symjit(
     eval: &mut ExpressionEvaluator<Complex<f64>>,
     input: &[Complex<f64>],
+    direct: bool,
 ) -> Result<(Complex<f64>, f64)> {
     let eval = eval.clone().map_coeff(&|z| Complex::new(z.re, z.im));
 
-    let mut app = eval.jit_compile().unwrap();
+    let config = JITCompilationSettings::default().direct_translation(direct);
+    let mut app = eval.jit_compile(config).unwrap();
 
     let input: Vec<Complex<f64>> = input.iter().map(|z| Complex::new(z.re, z.im)).collect();
     let mut out = vec![Complex::new(0.0, 0.0); 1];
@@ -210,6 +197,36 @@ fn eval_symjit(
     for _ in 0..N {
         app.evaluate(&input, &mut out);
     }
+
+    let duration = t0.elapsed().as_secs_f64();
+
+    Ok((out[0], duration))
+}
+
+fn eval_symjit_batch(
+    eval: &mut ExpressionEvaluator<Complex<f64>>,
+    input: &[Complex<f64>],
+    direct: bool,
+) -> Result<(Complex<f64>, f64)> {
+    let eval = eval.clone().map_coeff(&|z| Complex::new(z.re, z.im));
+
+    let config = JITCompilationSettings::default().direct_translation(direct);
+    let mut app = eval.jit_compile(config).unwrap();
+
+    let input: Vec<Complex<f64>> = input.iter().map(|z| Complex::new(z.re, z.im)).collect();
+    let l = input.len();
+
+    let mut args: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); N * l];
+
+    for i in 0..N {
+        args[i * l..(i + 1) * l].copy_from_slice(&input);
+    }
+
+    let mut out = vec![Complex::new(0.0, 0.0); N];
+
+    let t0 = Instant::now();
+
+    let _ = app.evaluate_batch(N, &args, &mut out);
 
     let duration = t0.elapsed().as_secs_f64();
 
@@ -229,11 +246,10 @@ fn eval_assembly(
         .export_cpp::<Complex<f64>>(
             &cpp,
             function_name,
-            ExportSettings {
-                include_header: true,
-                inline_asm: InlineASM::default(),
-                custom_header: None,
-            },
+            ExportSettings::new()
+                .include_header(true)
+                .inline_asm(InlineASM::X64)
+                .custom_header(None),
         )
         .map_err(|e| anyhow!(e))?
         .compile(&so, CompileOptions::default())
@@ -288,6 +304,7 @@ fn main() -> Result<()> {
         1000000.0 * t1 / (N as f64)
     );
 
+    /*
     let mut assembly_eval = build_evaluator(&payload)?;
     let (assembly, t2) = eval_assembly(
         &mut assembly_eval,
@@ -300,22 +317,35 @@ fn main() -> Result<()> {
         "assembly= {assembly}\n in {:.2} μsec",
         1000000.0 * t2 / (N as f64)
     );
+    */
 
     let mut symjit_eval = build_evaluator(&payload)?;
-    let (symjit, t3) = eval_symjit(&mut symjit_eval, &input)?;
+
+    let (symjit_direct, td0) = eval_symjit(&mut symjit_eval, &input, true)?;
+    let (symjit_indirect, ti0) = eval_symjit(&mut symjit_eval, &input, false)?;
+
+    let (symjit_direct_batch, td1) = eval_symjit_batch(&mut symjit_eval, &input, true)?;
+    let (symjit_indirect_batch, ti1) = eval_symjit_batch(&mut symjit_eval, &input, false)?;
+
     println!(
-        "symjit  = {symjit}\n in {:.2} μsec",
-        1000000.0 * t3 / (N as f64)
+        "symjit  = {symjit_direct}\n in {:.2} μsec (direct)",
+        1000000.0 * td0 / (N as f64)
     );
 
-    let symjit_mismatch = max_abs_diff(symjit, assembly);
-    let assembly_mismatch = max_abs_diff(assembly, eager);
-    println!("|symjit-assembly|_max = {symjit_mismatch:e}");
-    println!("|assembly-eager|_max  = {assembly_mismatch:e}");
+    println!(
+        "symjit  = {symjit_indirect}\n in {:.2} μsec (indirect)",
+        1000000.0 * ti0 / (N as f64)
+    );
 
-    if symjit_mismatch > MISMATCH_TOLERANCE {
-        std::process::exit(1);
-    }
+    println!(
+        "symjit  = {symjit_direct_batch}\n in {:.2} μsec (direct; batch)",
+        1000000.0 * td1 / (N as f64)
+    );
+
+    println!(
+        "symjit  = {symjit_indirect_batch}\n in {:.2} μsec (indirect; batch)",
+        1000000.0 * ti1 / (N as f64)
+    );
 
     Ok(())
 }

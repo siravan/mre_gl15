@@ -9,8 +9,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # symjit = { path = "../symjit-crate" }
 # symjit = "=2.14.8"
-# symbolica = { git = "https://github.com/benruijl/symbolica", rev = "26e0b19f50135bc6bb66d70eebbe20033d49b9d1", default-features = false, features = ["serde", "bincode"] }
-symbolica = { path = "../symbolica" }
+# symbolica = { path = "../symbolica" }
+symbolica = "2.0"
 
 [patch.crates-io]
 # numerica = { git = "https://github.com/benruijl/symbolica", rev = "26e0b19f50135bc6bb66d70eebbe20033d49b9d1" }
