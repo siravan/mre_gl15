@@ -21,6 +21,9 @@ use symbolica::{
 
 use std::time::Instant;
 
+mod model;
+use crate::model::*;
+
 const N: usize = 10000;
 
 const DEFAULT_PAYLOAD: &str = "payload.json";
@@ -186,10 +189,15 @@ fn eval_symjit(
 ) -> Result<(Complex<f64>, f64)> {
     let eval = eval.clone().map_coeff(&|z| Complex::new(z.re, z.im));
 
+    let code = eval.export_instructions();
+    let l = write_instructions(code).unwrap();
+    std::fs::write("mre_gl15.txt", l)?;
+
     let config = JITCompilationSettings::default().direct_translation(direct);
     let mut app = eval.jit_compile(config).unwrap();
 
     let input: Vec<Complex<f64>> = input.iter().map(|z| Complex::new(z.re, z.im)).collect();
+    println!("{:?}", &input);
     let mut out = vec![Complex::new(0.0, 0.0); 1];
 
     let t0 = Instant::now();
